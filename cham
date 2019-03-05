@@ -1,0 +1,110 @@
+#include "windows.h"
+#include "intrin.h"
+#include "d3d9.h"
+#include "d3dx9.h"
+#include "Detours.h"
+
+#pragma comment (lib,"d3d9.lib")
+#pragma comment (lib,"d3dx9.lib")
+#pragma comment(lib,"detours.lib")
+
+#pragma intrinsic(_ReturnAddress)
+
+#define Player 0xF55C41
+bool bInit = false;
+bool bChams = true;
+LPDIRECT3DTEXTURE9 texRed = NULL;
+
+typedef HRESULT(WINAPI *Prototype_Present)(LPDIRECT3DDEVICE9, CONST RECT*, CONST RECT*, HWND, CONST RGNDATA*);
+typedef HRESULT(WINAPI *Prototype_DrawIndexedPrimitive)(LPDIRECT3DDEVICE9, D3DPRIMITIVETYPE, INT, UINT, UINT, UINT, UINT);
+
+Prototype_Present Original_Present;
+Prototype_DrawIndexedPrimitive Original_DrawIndexedPrimitive;
+
+HRESULT WINAPI Hooked_Present(LPDIRECT3DDEVICE9 Device, CONST RECT *pSrcRect, CONST RECT *pDestRect, HWND hDestWindow, CONST RGNDATA *pDirtyRegion);
+HRESULT WINAPI Hooked_DrawIndexedPrimitive(LPDIRECT3DDEVICE9 Device, D3DPRIMITIVETYPE PrimType, INT BaseVertexIndex, UINT MinVertexIndex, UINT NumVertices, UINT startIndex, UINT primCount);
+
+DWORD FindDevice(DWORD Len)
+{
+	DWORD dwObjBase = 0;
+
+	dwObjBase = (DWORD)LoadLibrary("d3d9.dll");
+	while (dwObjBase++ < dwObjBase + Len)
+	{
+		if ((*(WORD*)(dwObjBase + 0x00)) == 0x06C7 && (*(WORD*)(dwObjBase + 0x06)) == 0x8689 && (*(WORD*)(dwObjBase + 0x0C)) == 0x8689) {
+			dwObjBase += 2; break;
+		}
+	}
+	return(dwObjBase);
+}
+
+DWORD GetDeviceAddress(int VTableIndex)
+{
+	PDWORD VTable;
+	*(DWORD*)&VTable = *(DWORD*)FindDevice(0x128000);
+	return VTable[VTableIndex];
+}
+HRESULT GenerateTexture(LPDIRECT3DDEVICE9 pDevice, IDirect3DTexture9 **ppD3Dtex, DWORD colour32)
+{
+	if (FAILED(pDevice->CreateTexture(8, 8, 1, 0, D3DFMT_A4R4G4B4, D3DPOOL_MANAGED, ppD3Dtex, NULL)))
+		return E_FAIL;
+
+	WORD colour16 = ((WORD)((colour32 >> 28) & 0xF) << 12)
+		| (WORD)(((colour32 >> 20) & 0xF) << 8)
+		| (WORD)(((colour32 >> 12) & 0xF) << 4)
+		| (WORD)(((colour32 >> 4) & 0xF) << 0);
+
+	D3DLOCKED_RECT d3dlr;
+	(*ppD3Dtex)->LockRect(0, &d3dlr, 0, 0);
+	WORD *pDst16 = (WORD*)d3dlr.pBits;
+
+	for (int xy = 0; xy < 8 * 8; xy++)
+		*pDst16++ = colour16;
+
+	(*ppD3Dtex)->UnlockRect(0);
+
+	return S_OK;
+}
+
+BOOL WINAPI DllMain(HINSTANCE hInstance, DWORD dwReason, LPVOID lpReserved)
+{
+	if (dwReason == DLL_PROCESS_ATTACH)
+	{
+		if (!bInit) {
+			Original_Present = (Prototype_Present)DetourFunction((PBYTE)GetDeviceAddress(17), (PBYTE)Hooked_Present);
+			Original_DrawIndexedPrimitive = (Prototype_DrawIndexedPrimitive)DetourFunction((PBYTE)GetDeviceAddress(82), (PBYTE)Hooked_DrawIndexedPrimitive);
+			bInit = true;
+		}
+	}
+	else if (dwReason == DLL_PROCESS_DETACH)
+	{
+		DetourRemove((PBYTE)Original_Present, (PBYTE)Hooked_Present);
+		DetourRemove((PBYTE)Original_DrawIndexedPrimitive, (PBYTE)Hooked_DrawIndexedPrimitive);
+	}
+
+	return TRUE;
+}
+
+HRESULT WINAPI Hooked_Present(LPDIRECT3DDEVICE9 Device, CONST RECT *pSrcRect, CONST RECT *pDestRect, HWND hDestWindow, CONST RGNDATA *pDirtyRegion) {
+
+	if (texRed == NULL) {
+		GenerateTexture(Device, &texRed, D3DCOLOR_ARGB(255, 255, 0, 0));
+	}
+
+	return Original_Present(Device, pSrcRect, pDestRect, hDestWindow, pDirtyRegion);
+}
+
+HRESULT WINAPI Hooked_DrawIndexedPrimitive(LPDIRECT3DDEVICE9 Device, D3DPRIMITIVETYPE PrimType, INT BaseVertexIndex, UINT MinVertexIndex, UINT NumVertices, UINT startIndex, UINT primCount) {
+
+	void* ReturnAddress = _ReturnAddress();
+
+	if (ReturnAddress == (void*)Player && bChams) {
+		Device->SetRenderState(D3DRS_ZENABLE, FALSE);
+		Device->SetTexture(0, texRed);
+		Original_DrawIndexedPrimitive(Device, PrimType, BaseVertexIndex, MinVertexIndex, NumVertices, startIndex, primCount);
+		Device->SetRenderState(D3DRS_ZENABLE, TRUE);
+		Device->SetTexture(0, texRed);
+	}
+
+	return Original_DrawIndexedPrimitive(Device, PrimType, BaseVertexIndex, MinVertexIndex, NumVertices, startIndex, primCount);
+}
